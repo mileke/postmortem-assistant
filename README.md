@@ -12,7 +12,7 @@ This project was built with Claude Code (Anthropic's coding agent) doing the pro
 
 | Requirement | What this app uses | Where in the code |
 | --- | --- | --- |
-| LLM | Llama 3.3 70B on Workers AI (`@cf/meta/llama-3.3-70b-instruct-fp8-fast`), with JSON mode for the structured steps | `src/ai.ts`, `src/prompts.ts` |
+| LLM | Llama 3.3 70B on Workers AI (`@cf/meta/llama-3.3-70b-instruct-fp8-fast`), JSON mode for one structured step and a prompted JSON contract for the other two | `src/ai.ts`, `src/prompts.ts` |
 | Workflow or coordination | A Cloudflare Workflow with five durable steps, each retried on failure | `src/workflow.ts` |
 | User input via chat | A chat page served as static assets from the same Worker (the Workers replacement for a Pages site) | `public/index.html`, `src/index.ts` |
 | Memory or state | A Durable Object per incident, SQLite-backed, holding the notes, every artifact and the whole conversation | `src/incident.ts` |
@@ -32,10 +32,10 @@ Worker router (src/index.ts)
 
 PostmortemWorkflow steps, each reading from and writing to the DO:
    1. load incident notes
-   2. extract timeline            -> Workers AI, JSON mode
+   2. extract timeline            -> Workers AI, prompted JSON
    3. generate clarifying questions -> Workers AI, JSON mode
    4. draft postmortem            -> Workers AI, Markdown
-   5. propose action items        -> Workers AI, JSON mode
+   5. propose action items        -> Workers AI, prompted JSON
 ```
 
 The Durable Object is the single source of truth. The Workflow never keeps state of its own beyond what each step returns; it writes every artifact into the Durable Object and advances a `stage` field, so the page can poll one endpoint and show progress as each step lands. The chat handler lives on the Durable Object too, so follow-up questions always see the raw notes, every artifact and the last 20 messages.
@@ -44,7 +44,7 @@ A few deliberate choices:
 
 - The Workflow instance id is the incident id, so the status endpoint can report both the app's stage and the Workflow's own status.
 - Each AI step saves its result inside the step. A retry overwrites rather than duplicates, so steps are safe to re-run.
-- Structured steps use Workers AI JSON mode with a schema. The draft step asks for Markdown because the page renders it directly.
+- The clarifying-questions step uses Workers AI JSON mode with a schema. The timeline and action-item steps put the same JSON Schema in the prompt and parse the reply instead, then normalise the fields in code. The reason is below. The draft step asks for Markdown because the page renders it directly.
 - The front end is one HTML file with no build step. It keeps the incident id in the URL hash and a short recent list in `localStorage`, so reloading or sharing the link reopens the same conversation from the Durable Object.
 - No secrets. Workers AI is reached through the `AI` binding.
 
@@ -73,6 +73,10 @@ Typecheck:
 ```bash
 npm run check
 ```
+
+## A finding from the end-to-end check
+
+The first deployed run came back with an empty timeline and no action items while the questions and the draft were fine. Probing Workers AI directly showed the cause: with `response_format: { type: "json_schema" }` and a schema whose property is an array of objects, Llama 3.3 on Workers AI returns `{"events": []}` after 7 completion tokens, with or without enums in the schema. The same messages without JSON mode return the full list. A flat array of strings works in JSON mode. So the two nested steps describe the schema in the prompt and parse the reply, and the code normalises kinds, priorities and missing fields rather than trusting the model to follow the schema exactly. Each of those steps also throws when the list comes back empty, so the Workflow retries instead of saving nothing.
 
 ## Limits worth knowing
 

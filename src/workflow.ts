@@ -1,5 +1,5 @@
 import { WorkflowEntrypoint, type WorkflowEvent, type WorkflowStep, type WorkflowStepConfig } from "cloudflare:workers";
-import { completeJson, completeText, type ChatTurn } from "./ai";
+import { completeJson, completePromptedJson, completeText, type ChatTurn } from "./ai";
 import type { ActionItem, TimelineEvent } from "./incident";
 import { ACTION_ITEMS, CLARIFYING_QUESTIONS, DRAFT_POSTMORTEM, EXTRACT_TIMELINE, TONE } from "./prompts";
 
@@ -68,10 +68,12 @@ export class PostmortemWorkflow extends WorkflowEntrypoint<Env, PostmortemParams
 			});
 
 			const timeline = await step.do<TimelineEvent[]>("extract timeline", RETRIES, async () => {
-				const result = await completeJson<{ events: TimelineEvent[] }>(ai, prompt(EXTRACT_TIMELINE, raw), TIMELINE_SCHEMA);
-				await incident().saveArtifact("timeline", result.events, renderTimeline(result.events));
+				const result = await completePromptedJson<{ events?: unknown[] }>(ai, prompt(EXTRACT_TIMELINE, raw), TIMELINE_SCHEMA);
+				const events = normaliseEvents(result.events);
+				if (events.length === 0) throw new Error("The model returned no timeline events");
+				await incident().saveArtifact("timeline", events, renderTimeline(events));
 				await incident().setStage("questions");
-				return result.events;
+				return events;
 			});
 
 			const questions = await step.do<string[]>("generate clarifying questions", RETRIES, async () => {
@@ -96,8 +98,10 @@ export class PostmortemWorkflow extends WorkflowEntrypoint<Env, PostmortemParams
 
 			await step.do("propose action items", RETRIES, async () => {
 				const input = `${raw}\n\n## Postmortem draft\n${draft}`;
-				const result = await completeJson<{ items: ActionItem[] }>(ai, prompt(ACTION_ITEMS, input), ACTIONS_SCHEMA);
-				await incident().saveArtifact("actions", result.items, renderActions(result.items));
+				const result = await completePromptedJson<{ items?: unknown[] }>(ai, prompt(ACTION_ITEMS, input), ACTIONS_SCHEMA);
+				const items = normaliseActions(result.items);
+				if (items.length === 0) throw new Error("The model returned no action items");
+				await incident().saveArtifact("actions", items, renderActions(items));
 				await incident().setStage("complete");
 			});
 
@@ -119,8 +123,45 @@ function prompt(instruction: string, notes: string): ChatTurn[] {
 	];
 }
 
+const KINDS = new Set(["detection", "escalation", "investigation", "mitigation", "resolution", "communication", "other"]);
+const TYPES = new Set(["prevent", "detect", "mitigate", "process"]);
+const PRIORITIES = new Set(["P1", "P2", "P3"]);
+
+function text(value: unknown, fallback: string): string {
+	return typeof value === "string" && value.trim() ? value.trim() : fallback;
+}
+
+function normaliseEvents(raw: unknown[] | undefined): TimelineEvent[] {
+	if (!Array.isArray(raw)) return [];
+	return raw
+		.filter((e): e is Record<string, unknown> => typeof e === "object" && e !== null)
+		.map((e) => {
+			const kind = text(e.kind, "other").toLowerCase();
+			return { time: text(e.time, "unknown"), event: text(e.event, ""), actor: text(e.actor, "unknown"), kind: KINDS.has(kind) ? kind : "other" };
+		})
+		.filter((e) => e.event);
+}
+
+function normaliseActions(raw: unknown[] | undefined): ActionItem[] {
+	if (!Array.isArray(raw)) return [];
+	return raw
+		.filter((a): a is Record<string, unknown> => typeof a === "object" && a !== null)
+		.map((a) => {
+			const type = text(a.type, "prevent").toLowerCase();
+			const priority = text(a.priority, "P2").toUpperCase();
+			return {
+				title: text(a.title, ""),
+				description: text(a.description, ""),
+				type: TYPES.has(type) ? type : "process",
+				priority: PRIORITIES.has(priority) ? priority : "P2",
+				owner: text(a.owner, "service owner"),
+			};
+		})
+		.filter((a) => a.title);
+}
+
 function renderTimeline(events: TimelineEvent[]): string {
-	const lines = events.map((e) => `- **${e.time}** (${e.kind}) ${e.event}${e.actor && e.actor !== "unknown" ? ` [${e.actor}]` : ""}`);
+	const lines = events.map((e) => `- **${e.time}** (${e.kind}) ${e.event}${e.actor !== "unknown" ? ` [${e.actor}]` : ""}`);
 	return `## Extracted timeline\n${lines.join("\n")}`;
 }
 
